@@ -3,7 +3,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import time
-import openai  # hoặc API AI khác mà bạn muốn sử dụng
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 class ZaloBot:
     def __init__(self):
@@ -81,7 +81,8 @@ class ZaloBot:
     def process_messages(self):
         print("Bắt đầu theo dõi tin nhắn...")
         last_processed_message = None
-        
+        consecutive_errors = 0  # Đếm số lần lỗi liên tiếp
+    
         while True:
             try:
                 latest_message = self.get_latest_message()
@@ -89,28 +90,74 @@ class ZaloBot:
                 if latest_message and latest_message != last_processed_message:
                     print(f"Tin nhắn mới nhận được: {latest_message}")
                     
-                    # Kiểm tra lệnh bật/tắt AI
-                    if latest_message.lower() == "@ai on":
-                        self.ai_enabled = True
-                        self.send_message("AI đã được bật")
-                        last_processed_message = latest_message
-                        continue
-                    elif latest_message.lower() == "@ai off":
-                        self.ai_enabled = False
-                        self.send_message("AI đã được tắt")
-                        last_processed_message = latest_message
-                        continue
+                    # Kiểm tra các lệnh @ai
+                    if latest_message.lower().startswith("@ai"):
+                        command = latest_message[4:].strip().lower()  # Lấy phần sau @ai
+                        
+                        if command == "on":
+                            self.ai_enabled = True
+                            self.send_message("AI đã được bật")
+                            consecutive_errors = 0
+                            last_processed_message = latest_message
+                            continue
+                        elif command == "off":
+                            self.ai_enabled = False
+                            self.send_message("AI đã được tắt")
+                            consecutive_errors = 0
+                            last_processed_message = latest_message
+                            continue
+                        elif command:  # Nếu có nội dung sau @ai
+                            print("Xử lý lệnh trực tiếp với AI...")
+                            try:
+                                with ThreadPoolExecutor() as executor:
+                                    future = executor.submit(self.get_ai_response, command)
+                                    try:
+                                        ai_response = future.result(timeout=30)
+                                        if ai_response:
+                                            print(f"Phản hồi từ AI: {ai_response}")
+                                            self.send_message(ai_response)
+                                            print("Đã gửi phản hồi")
+                                            consecutive_errors = 0
+                                        else:
+                                            raise Exception("Không nhận được phản hồi từ AI")
+                                    except TimeoutError:
+                                        raise Exception("AI phản hồi quá thời gian")
+                            except Exception as ai_error:
+                                print(f"Lỗi AI: {ai_error}")
+                                consecutive_errors += 1
+                                if consecutive_errors >= 3:
+                                    self.ai_enabled = False
+                                    self.send_message("AI đã tự động tắt do gặp lỗi liên tục. Vui lòng kiểm tra kết nối và bật lại bằng lệnh @ai on")
+                                    consecutive_errors = 0
+                            last_processed_message = latest_message
+                            continue
                     
-                    # Chỉ xử lý tin nhắn từ người khác và khi AI được bật
+                    # Xử lý tin nhắn thông thường khi AI được bật
                     is_own_message = self.driver.find_elements(By.CSS_SELECTOR, "div.chat-item.me span.text")[-1].text == latest_message
                     if not is_own_message and self.ai_enabled:
                         print("Đang xử lý với AI...")
-                        ai_response = self.get_ai_response(latest_message)
-                        
-                        if ai_response:
-                            print(f"Phản hồi từ AI: {ai_response}")
-                            self.send_message(ai_response)
-                            print("Đã gửi phản hồi")
+                        try:
+                            # Thêm timeout cho việc lấy phản hồi AI
+                            with ThreadPoolExecutor() as executor:
+                                future = executor.submit(self.get_ai_response, latest_message)
+                                try:
+                                    ai_response = future.result(timeout=30)  # Timeout sau 30 giây
+                                    if ai_response:
+                                        print(f"Phản hồi từ AI: {ai_response}")
+                                        self.send_message(ai_response)
+                                        print("Đã gửi phản hồi")
+                                        consecutive_errors = 0  # Reset số lần lỗi nếu thành công
+                                    else:
+                                        raise Exception("Không nhận được phản hồi từ AI")
+                                except TimeoutError:
+                                    raise Exception("AI phản hồi quá thời gian")
+                        except Exception as ai_error:
+                            print(f"Lỗi AI: {ai_error}")
+                            consecutive_errors += 1
+                            if consecutive_errors >= 3:  # Nếu lỗi 3 lần liên tiếp
+                                self.ai_enabled = False
+                                self.send_message("AI đã tự động tắt do gặp lỗi liên tục. Vui lòng kiểm tra kết nối và bật lại bằng lệnh @ai on")
+                                consecutive_errors = 0
                     
                     last_processed_message = latest_message
                 
@@ -118,6 +165,14 @@ class ZaloBot:
                 
             except Exception as e:
                 print(f"Có lỗi xảy ra: {e}")
+                consecutive_errors += 1
+                if consecutive_errors >= 3:  # Nếu lỗi 3 lần liên tiếp
+                    self.ai_enabled = False
+                    try:
+                        self.send_message("AI đã tự động tắt do gặp lỗi liên tục. Vui lòng kiểm tra kết nối và bật lại bằng lệnh @ai on")
+                    except:
+                        print("Không thể gửi thông báo lỗi")
+                    consecutive_errors = 0
                 time.sleep(1)
     
     def get_ai_response(self, message):
